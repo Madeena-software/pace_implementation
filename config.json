@@ -1,0 +1,27 @@
+{
+    "proj_img_path": "E:/DataBetaTest/07082024/36-KSW-36B/mentah/36-KSW-36B_Pedis_R 36-KSW-36B 80kV50mA0,50s -8_7_2024-10.34 AM [Administrator].mdn",
+    "gain_img_path": "E:/Project/imager-pipeline/imager-pipeline/datacitra/Gain/Bed/80_50_0,50.mdn",
+    "dark_img_path": "E:/Project/imager-pipeline/imager-pipeline/datacitra/Dark/Bed/dark.mdn",
+    "calibration_path": "",
+    "output_dir": "",
+    
+    "ffc_median_filter_size": 7,
+    
+    "bemd_max_iterations": 1,
+    "bemd_threshold": 1.0,
+    "bemd_initial_window_size": 32,
+    "bemd_local_extrema_count": 10,
+    
+    "d0_values": [20, 30, 40],
+    "rh_values": [1.5, 2.0, 2.5],
+    "rl_values": [0.3, 0.5],
+    "gamma_values": [0.8],
+    "clip_limit_values": [3.0],
+    "tile_grid_size_values": [[8, 8]],
+    
+    "denoise_r": 1,
+    "denoise_beta": 0.5,
+    
+    "output_width": 4096,
+    "num_threads": 8
+}
