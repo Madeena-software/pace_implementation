@@ -43,6 +43,21 @@ print(f"Best parameters: {result.parameters}")
 print(f"Total Score: {result.total_score:.4f}")
 ```
 
+### PACE Mode (skip FFC + spatial calibration)
+
+```python
+from image_pipeline import ImageProcessingPipeline, PipelineConfig
+
+config = PipelineConfig(
+    proj_img_path="path/to/projection.tiff",
+    output_dir="path/to/output",
+    processing_mode="pace",
+)
+
+pipeline = ImageProcessingPipeline(config)
+result = pipeline.process(show_plot=True, mode="pace")
+```
+
 ### Using JSON Configuration
 
 ```python
@@ -80,6 +95,7 @@ result = pipeline.process()
 | `denoise_beta` | float | 0.5 | Residual weight in reconstruction |
 | `output_width` | int | 4096 | Target output width |
 | `num_threads` | int | 8 | Number of parallel threads |
+| `processing_mode` | str | "full" | "full" or "pace" |
 
 ## Processing Pipeline
 
@@ -94,6 +110,14 @@ result = pipeline.process()
    - CLAHE enhancement
 6. **Evaluation**: Calculate CII, entropy, and EME metrics
 7. **Output**: Normalize, resize, and save the result
+
+### PACE Processing Flow
+
+1. **Load Image**: Load projection image only
+2. **BEMD Decomposition**: Extract BIMFs from image
+3. **Parameter Optimization**: Homomorphic filtering, denoising, gamma correction, CLAHE
+4. **Evaluation**: Calculate CII, entropy, and EME metrics
+5. **Output**: Normalize, resize, and save the result
 
 ## Using Individual Modules
 
@@ -139,6 +163,21 @@ refactored/
 ├── image_pipeline.py    # Main module with all classes
 ├── config.json          # Example configuration file
 └── README.md            # This file
+```
+
+## Batch Processing (PACE)
+
+```python
+from image_pipeline import ImageProcessingPipeline, PipelineConfig
+
+config = PipelineConfig(processing_mode="pace")
+pipeline = ImageProcessingPipeline(config)
+
+results = pipeline.process_batch(
+    input_dir="path/to/projections",
+    output_dir="path/to/output",
+    mode="pace"
+)
 ```
 
 ## Migration from Original Code

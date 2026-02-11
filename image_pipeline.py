@@ -89,6 +89,9 @@ class PipelineConfig:
     # Output parameters
     output_width: int = 4096
     num_threads: int = 8
+
+    # Processing mode: "full" (with FFC + spatial calibration) or "pace" (skip both)
+    processing_mode: str = "full"
     
     @classmethod
     def from_json(cls, filepath: str) -> "PipelineConfig":
@@ -754,6 +757,27 @@ class ImageProcessingPipeline:
         
         logger.info("Images loaded successfully.")
         return proj_img, gain_img, dark_img
+
+    def load_projection(self, proj_path: Optional[str] = None) -> np.ndarray:
+        """
+        Load projection image only (PACE mode).
+
+        Args:
+            proj_path: Path to projection image. Uses config if None.
+
+        Returns:
+            Projection image.
+        """
+        logger.info("Loading projection image...")
+
+        proj_path = proj_path or self.config.proj_img_path
+        proj_img = cv2.imread(proj_path, -1)
+
+        if proj_img is None:
+            raise FileNotFoundError(f"Could not load projection image: {proj_path}")
+
+        logger.info("Projection image loaded successfully.")
+        return proj_img
     
     def apply_ffc(
         self,
@@ -937,7 +961,8 @@ class ImageProcessingPipeline:
         dark_path: Optional[str] = None,
         calibration_path: Optional[str] = None,
         output_path: Optional[str] = None,
-        show_plot: bool = True
+        show_plot: bool = True,
+        mode: Optional[str] = None
     ) -> ProcessingResult:
         """
         Run the complete image processing pipeline.
@@ -954,14 +979,27 @@ class ImageProcessingPipeline:
             ProcessingResult with best processed image.
         """
         try:
-            # Load images
-            proj_img, gain_img, dark_img = self.load_images(proj_path, gain_path, dark_path)
-            
-            # Apply flat field correction
-            ffc_img = self.apply_ffc(proj_img, gain_img, dark_img)
-            
-            # Apply spatial calibration
-            calibrated_img = self.apply_spatial_calibration(ffc_img, calibration_path)
+            processing_mode = (mode or self.config.processing_mode).lower().strip()
+
+            if processing_mode not in {"full", "pace"}:
+                raise ValueError("mode must be either 'full' or 'pace'")
+
+            if processing_mode == "pace":
+                # Load projection only
+                proj_img = self.load_projection(proj_path)
+                calibrated_img = proj_img
+                ffc_img = None
+                gain_img = None
+                dark_img = None
+            else:
+                # Load images
+                proj_img, gain_img, dark_img = self.load_images(proj_path, gain_path, dark_path)
+
+                # Apply flat field correction
+                ffc_img = self.apply_ffc(proj_img, gain_img, dark_img)
+
+                # Apply spatial calibration
+                calibrated_img = self.apply_spatial_calibration(ffc_img, calibration_path)
             
             # Decompose image
             bimfs, energies = self.decompose_image(calibrated_img)
@@ -983,7 +1021,10 @@ class ImageProcessingPipeline:
             
             # Display results
             if show_plot:
-                self._plot_results(proj_img, calibrated_img, final_image)
+                if processing_mode == "pace":
+                    self._plot_results(proj_img, None, final_image)
+                else:
+                    self._plot_results(proj_img, calibrated_img, final_image)
             
             # Cleanup
             self._cleanup(
@@ -1000,24 +1041,35 @@ class ImageProcessingPipeline:
     def _plot_results(
         self,
         original: np.ndarray,
-        calibrated: np.ndarray,
+        calibrated: Optional[np.ndarray],
         processed: np.ndarray
     ) -> None:
         """Display processing results."""
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        axes[0].imshow(original, cmap='gray')
-        axes[0].set_title('Original Image')
-        axes[0].axis('off')
-        
-        axes[1].imshow(calibrated, cmap='gray')
-        axes[1].set_title('Calibrated Image')
-        axes[1].axis('off')
-        
-        axes[2].imshow(processed, cmap='gray')
-        axes[2].set_title('Processed Image')
-        axes[2].axis('off')
-        
+        if calibrated is None:
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+            axes[0].imshow(original, cmap='gray')
+            axes[0].set_title('Input Image')
+            axes[0].axis('off')
+
+            axes[1].imshow(processed, cmap='gray')
+            axes[1].set_title('Processed Image')
+            axes[1].axis('off')
+        else:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+            axes[0].imshow(original, cmap='gray')
+            axes[0].set_title('Original Image')
+            axes[0].axis('off')
+
+            axes[1].imshow(calibrated, cmap='gray')
+            axes[1].set_title('Calibrated Image')
+            axes[1].axis('off')
+
+            axes[2].imshow(processed, cmap='gray')
+            axes[2].set_title('Processed Image')
+            axes[2].axis('off')
+
         plt.tight_layout()
         plt.show()
     
@@ -1025,10 +1077,52 @@ class ImageProcessingPipeline:
         """Clean up memory."""
         logger.info("Cleaning up memory...")
         for arr in arrays:
-            del arr
+            if arr is not None:
+                del arr
         cp._default_memory_pool.free_all_blocks()
         gc.collect()
         logger.info("Memory cleaned.")
+
+    def process_batch(
+        self,
+        input_dir: str,
+        output_dir: str,
+        mode: Optional[str] = None,
+        extensions: Tuple[str, ...] = (".tiff", ".tif", ".mdn")
+    ) -> List[ProcessingResult]:
+        """
+        Batch process images in a directory.
+
+        Args:
+            input_dir: Directory with projection images.
+            output_dir: Directory for processed outputs.
+            mode: "full" or "pace". Defaults to config.processing_mode.
+            extensions: File extensions to include.
+
+        Returns:
+            List of ProcessingResult objects.
+        """
+        results: List[ProcessingResult] = []
+        input_dir = os.path.abspath(input_dir)
+        output_dir = os.path.abspath(output_dir)
+
+        for filename in os.listdir(input_dir):
+            if filename.lower().endswith(extensions):
+                proj_path = os.path.join(input_dir, filename)
+                output_path = os.path.join(
+                    output_dir,
+                    Path(filename).stem + "_processed.tiff"
+                )
+
+                result = self.process(
+                    proj_path=proj_path,
+                    output_path=output_path,
+                    show_plot=False,
+                    mode=mode
+                )
+                results.append(result)
+
+        return results
 
 
 # =============================================================================
