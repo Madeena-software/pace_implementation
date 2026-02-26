@@ -176,13 +176,13 @@ class FlatFieldCorrection:
         proj_dark = cp.subtract(proj, dark)
         gain_dark = cp.subtract(gain, dark)
         
-        proj_dark[proj_dark <= 0] = 1e-12
-        gain_dark[gain_dark <= 0] = 0
+        proj_dark[proj_dark <= 0] = 0
+        gain_dark[gain_dark <= 0] = 1e-12
         
-        intensity = cp.divide(gain_dark, proj_dark)
+        intensity = cp.divide(proj_dark, gain_dark)
         intensity[intensity <= 0] = 1e-12
         
-        miu = cp.log(intensity)
+        miu = -cp.log(intensity)
         miu = miu.astype(cp.float32)
         miu[miu < 0] = 0
         
