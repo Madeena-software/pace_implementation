@@ -38,6 +38,8 @@ from cupyx.scipy.ndimage import (
 )
 import matplotlib.pyplot as plt
 
+from fabemd import FABEMD
+
 
 # Configure logging
 logging.basicConfig(
@@ -86,6 +88,18 @@ class PipelineConfig:
     denoise_r: int = 1
     denoise_beta: float = 0.5
     
+    # FABEMD parameters (used when decomposition_method="fabemd")
+    fabemd_max_sift_iterations: int = 10
+    fabemd_sd_threshold: float = 0.2
+    fabemd_min_extrema: int = 5
+    fabemd_max_bimfs: int = 100
+    fabemd_window_size_cap: int = 201
+    fabemd_extrema_window: int = 3
+    fabemd_initial_window_size: Optional[int] = None
+
+    # Decomposition method: "bemd" or "fabemd"
+    decomposition_method: str = "fabemd"
+
     # Output parameters
     output_width: int = 4096
     num_threads: int = 8
@@ -713,6 +727,15 @@ class ImageProcessingPipeline:
             initial_window_size=self.config.bemd_initial_window_size,
             local_extrema_count=self.config.bemd_local_extrema_count,
         )
+        self.fabemd = FABEMD(
+            max_sift_iterations=self.config.fabemd_max_sift_iterations,
+            sd_threshold=self.config.fabemd_sd_threshold,
+            min_extrema=self.config.fabemd_min_extrema,
+            max_bimfs=self.config.fabemd_max_bimfs,
+            initial_window_size=self.config.fabemd_initial_window_size,
+            window_size_cap=self.config.fabemd_window_size_cap,
+            extrema_window=self.config.fabemd_extrema_window,
+        )
         self.nonlinear_filter = NonlinearFilter(
             r=self.config.denoise_r,
             beta=self.config.denoise_beta,
@@ -798,16 +821,31 @@ class ImageProcessingPipeline:
         calibrator = SpatialCalibration(calib_path)
         return calibrator.apply(image)
     
-    def decompose_image(self, image: np.ndarray) -> Tuple[List[cp.ndarray], List[float]]:
+    def decompose_image(
+        self, image: np.ndarray, method: Optional[str] = None
+    ) -> Tuple[List[cp.ndarray], List[float]]:
         """
-        Decompose image using BEMD.
-        
+        Decompose image using BEMD or FABEMD.
+
+        Args:
+            image: Input image (numpy array).
+            method: "bemd" or "fabemd". Defaults to config.decomposition_method.
+
         Returns:
             Tuple of (BIMFs, energies).
         """
-        logger.info("Starting image decomposition (BEMD)...")
-        bimfs = self.bemd.decompose(cp.asarray(image))
-        energies = BEMD.calculate_energies(bimfs)
+        method = (method or self.config.decomposition_method).lower().strip()
+        gpu_image = cp.asarray(image)
+
+        if method == "fabemd":
+            logger.info("Starting image decomposition (FABEMD)...")
+            bimfs = self.fabemd.decompose(gpu_image)
+            energies = FABEMD.calculate_energies(bimfs)
+        else:
+            logger.info("Starting image decomposition (BEMD)...")
+            bimfs = self.bemd.decompose(gpu_image)
+            energies = BEMD.calculate_energies(bimfs)
+
         logger.info("Image decomposition completed.")
         return bimfs, energies
     
