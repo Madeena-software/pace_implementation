@@ -28,17 +28,42 @@ import itertools
 
 import cv2
 import numpy as np
-import cupy as cp
-from cupyx.scipy.ndimage import (
-    median_filter,
-    maximum_filter,
-    minimum_filter,
-    uniform_filter,
-    zoom,
-)
+
+# ---------------------------------------------------------------------------
+# GPU / CPU compatibility layer
+# ---------------------------------------------------------------------------
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import (
+        median_filter,
+        maximum_filter,
+        minimum_filter,
+        uniform_filter,
+        zoom,
+    )
+    HAS_CUPY = True
+except ImportError:
+    from scipy.ndimage import (
+        median_filter,
+        maximum_filter,
+        minimum_filter,
+        uniform_filter,
+        zoom,
+    )
+    # Alias numpy as cp so existing class code works unchanged
+    cp = np  # type: ignore[misc]
+    HAS_CUPY = False
+
 import matplotlib.pyplot as plt
 
 from fabemd import FABEMD
+
+
+def _to_numpy(arr) -> np.ndarray:
+    """Convert cupy or numpy array to numpy."""
+    if HAS_CUPY and isinstance(arr, cp.ndarray):
+        return arr.get()
+    return np.asarray(arr)
 
 
 # Configure logging
@@ -256,10 +281,7 @@ class SpatialCalibration:
         """
         logger.info("Applying Spatial Calibration...")
         
-        if isinstance(image, cp.ndarray):
-            img = image.get()
-        else:
-            img = image
+        img = _to_numpy(image)
         
         img = self._undistort(img)
         img = self._crop_image(img, self.roi)
@@ -408,7 +430,7 @@ class BEMD:
         """Calculate energies of BIMFs."""
         energies = []
         for bimf in bimfs:
-            energy = float(np.sum(np.square(np.array(bimf.get()))))
+            energy = float(np.sum(np.square(_to_numpy(bimf))))
             energies.append(energy)
         return energies
 
@@ -442,7 +464,7 @@ class HomomorphicFilter:
             Filtered image as uint16.
         """
         if not isinstance(image, np.ndarray):
-            img = image.get()
+            img = _to_numpy(image)
         else:
             img = image
         
@@ -528,7 +550,7 @@ class NonlinearFilter:
         for i in range(int(self.r)):
             index = sorted_indices[i]
             denoised = cv2.bilateralFilter(
-                bimfs[index].get().astype(np.float32), 5, 75, 75
+                _to_numpy(bimfs[index]).astype(np.float32), 5, 75, 75
             )
             denoised_bimfs.append(denoised)
         
@@ -536,7 +558,7 @@ class NonlinearFilter:
         I_E = np.sum(denoised_bimfs, axis=0)
         for j in range(int(self.r), len(bimfs)):
             index = sorted_indices[j]
-            I_E += np.array(bimfs[index].get())
+            I_E += _to_numpy(bimfs[index])
         
         # Reconstruct with filtered residual
         I_L = I_E + self.beta * filtered_residual
@@ -964,7 +986,7 @@ class ImageProcessingPipeline:
         # Resize
         resized = self.resizer.resize(img, target_width)
         
-        return resized.get()
+        return _to_numpy(resized)
     
     def save_image(
         self,
@@ -1117,7 +1139,8 @@ class ImageProcessingPipeline:
         for arr in arrays:
             if arr is not None:
                 del arr
-        cp._default_memory_pool.free_all_blocks()
+        if HAS_CUPY:
+            cp._default_memory_pool.free_all_blocks()
         gc.collect()
         logger.info("Memory cleaned.")
 

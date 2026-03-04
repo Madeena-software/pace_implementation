@@ -13,9 +13,10 @@ Key features:
 - Order-statistics filters (MAX/MIN) for envelope estimation (no surface
   interpolation needed)
 - Envelope smoothing via averaging filters
-- GPU-accelerated using CuPy
+- GPU-accelerated using CuPy when available, falls back to NumPy/SciPy
 
 Compatible with the `BEMD` interface in `image_pipeline.py`.
+Compatible with Google Colab (GPU or CPU runtime).
 
 Author: Refactored and improved from Bhuiyan et al. (2008) paper
 """
@@ -25,12 +26,46 @@ import logging
 from typing import List, Tuple, Optional
 
 import numpy as np
-import cupy as cp
-from cupyx.scipy.ndimage import (
-    maximum_filter,
-    minimum_filter,
-    uniform_filter,
-)
+
+# ---------------------------------------------------------------------------
+# GPU / CPU compatibility layer
+# ---------------------------------------------------------------------------
+try:
+    import cupy as cp
+    from cupyx.scipy.ndimage import (
+        maximum_filter as _maximum_filter,
+        minimum_filter as _minimum_filter,
+        uniform_filter as _uniform_filter,
+    )
+    HAS_CUPY = True
+except ImportError:
+    from scipy.ndimage import (
+        maximum_filter as _maximum_filter,
+        minimum_filter as _minimum_filter,
+        uniform_filter as _uniform_filter,
+    )
+    HAS_CUPY = False
+
+
+def _xp():
+    """Return the active array module (cupy or numpy)."""
+    return cp if HAS_CUPY else np
+
+
+def _to_numpy(arr) -> np.ndarray:
+    """Convert an array to NumPy regardless of backend."""
+    if HAS_CUPY and isinstance(arr, cp.ndarray):
+        return arr.get()
+    return np.asarray(arr)
+
+
+def _to_xp(arr):
+    """Convert an array to the active backend."""
+    xp = _xp()
+    if xp is np:
+        return np.asarray(arr)
+    return cp.asarray(arr)
+
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +141,8 @@ class FABEMD:
     # ------------------------------------------------------------------
     @staticmethod
     def _find_local_extrema(
-        image: cp.ndarray, window_size: int = 3
-    ) -> Tuple[cp.ndarray, cp.ndarray]:
+        image, window_size: int = 3
+    ):
         """
         Detect local maxima and minima maps using morphological comparison.
 
@@ -116,19 +151,19 @@ class FABEMD:
 
         Parameters
         ----------
-        image : cp.ndarray
+        image : ndarray (cupy or numpy)
             Input 2-D array.
         window_size : int
             Neighbourhood size for the comparison.
 
         Returns
         -------
-        max_map, min_map : cp.ndarray (bool)
+        max_map, min_map : ndarray (bool)
             Boolean masks of detected maxima / minima.
         """
         mask = image != 0
-        max_map = (image == maximum_filter(image, size=window_size)) & mask
-        min_map = (image == minimum_filter(image, size=window_size)) & mask
+        max_map = (image == _maximum_filter(image, size=window_size)) & mask
+        min_map = (image == _minimum_filter(image, size=window_size)) & mask
         return max_map, min_map
 
     # ------------------------------------------------------------------
@@ -136,7 +171,7 @@ class FABEMD:
     # ------------------------------------------------------------------
     @staticmethod
     def _compute_adaptive_window_size(
-        extrema_map: cp.ndarray,
+        extrema_map,
         image_shape: Tuple[int, int],
         cap: int = 201,
         max_sample: int = 2000,
@@ -153,7 +188,7 @@ class FABEMD:
 
         Parameters
         ----------
-        extrema_map : cp.ndarray (bool)
+        extrema_map : ndarray (bool)
             Boolean mask of extrema positions.
         image_shape : tuple of int
             (rows, cols) of the image.
@@ -167,8 +202,9 @@ class FABEMD:
         w : int
             Odd-valued adaptive window size (clamped to [3, cap]).
         """
+        xp = _xp()
         # Get extrema coordinates on CPU for spatial analysis
-        positions = cp.argwhere(extrema_map).get()  # (N, 2)
+        positions = _to_numpy(xp.argwhere(extrema_map))  # (N, 2)
         n = len(positions)
 
         if n < 2:
@@ -211,17 +247,17 @@ class FABEMD:
     # ------------------------------------------------------------------
     @staticmethod
     def _estimate_envelope(
-        image: cp.ndarray,
+        image,
         window_size: int,
         filter_type: str = "max",
-    ) -> cp.ndarray:
+    ):
         """
         Estimate an envelope surface using an order-statistics filter
         followed by averaging (smoothing).
 
         Parameters
         ----------
-        image : cp.ndarray
+        image : ndarray (cupy or numpy)
             Input 2-D signal.
         window_size : int
             Window size for both the order-statistics filter and the
@@ -231,54 +267,57 @@ class FABEMD:
 
         Returns
         -------
-        smoothed_envelope : cp.ndarray
+        smoothed_envelope : ndarray
         """
         if filter_type == "max":
-            envelope = maximum_filter(image, size=window_size)
+            envelope = _maximum_filter(image, size=window_size)
         elif filter_type == "min":
-            envelope = minimum_filter(image, size=window_size)
+            envelope = _minimum_filter(image, size=window_size)
         else:
             raise ValueError("filter_type must be 'max' or 'min'")
         # Smooth the envelope with an averaging filter
-        return uniform_filter(envelope, size=window_size)
+        return _uniform_filter(envelope, size=window_size)
 
     # ------------------------------------------------------------------
     # SD stopping criterion
     # ------------------------------------------------------------------
     @staticmethod
-    def _compute_sd(prev: cp.ndarray, curr: cp.ndarray) -> float:
+    def _compute_sd(prev, curr) -> float:
         """
         Compute the normalised standard-deviation between successive sifting
         iterates (Huang et al. criterion).
 
         SD = sum((prev - curr)^2) / sum(prev^2)
         """
-        denom = cp.sum(prev ** 2)
+        xp = _xp()
+        denom = xp.sum(prev ** 2)
         if float(denom) == 0:
             return 0.0
-        return float(cp.sum((curr - prev) ** 2) / denom)
+        return float(xp.sum((curr - prev) ** 2) / denom)
 
     # ------------------------------------------------------------------
     # Main decomposition
     # ------------------------------------------------------------------
-    def decompose(self, image: cp.ndarray) -> List[cp.ndarray]:
+    def decompose(self, image) -> list:
         """
         Perform FABEMD decomposition on an input image.
 
         Parameters
         ----------
-        image : cp.ndarray
+        image : ndarray (cupy or numpy)
             Input 2-D image (will be cast to float64 internally).
 
         Returns
         -------
-        bimfs : list of cp.ndarray
+        bimfs : list of ndarray
             Extracted BIMFs ordered from highest to lowest frequency.
         """
+        xp = _xp()
         logger.info("Starting FABEMD decomposition...")
 
-        residual = image.astype(cp.float64)
-        bimfs: List[cp.ndarray] = []
+        image = _to_xp(image)
+        residual = image.astype(xp.float64)
+        bimfs: list = []
 
         while len(bimfs) < self.max_bimfs:
             h = residual.copy()
@@ -330,7 +369,7 @@ class FABEMD:
 
             # 6. Check stopping criteria on residual
             max_map, min_map = self._find_local_extrema(residual)
-            n_extrema = int(cp.sum(max_map) + cp.sum(min_map))
+            n_extrema = int(xp.sum(max_map) + xp.sum(min_map))
             print(
                 f"\rFABEMD: {len(bimfs)} BIMFs | "
                 f"residual extrema: {n_extrema}",
@@ -357,12 +396,13 @@ class FABEMD:
     # Utility methods (compatible with BEMD interface)
     # ------------------------------------------------------------------
     @staticmethod
-    def calculate_energies(bimfs: List[cp.ndarray]) -> List[float]:
+    def calculate_energies(bimfs: list) -> List[float]:
         """Calculate energy (sum of squares) of each BIMF."""
-        return [float(cp.sum(b ** 2)) for b in bimfs]
+        xp = _xp()
+        return [float(xp.sum(b ** 2)) for b in bimfs]
 
     @staticmethod
-    def calculate_entropy(bimf: cp.ndarray, bins: int = 256) -> float:
+    def calculate_entropy(bimf, bins: int = 256) -> float:
         """
         Calculate Shannon entropy of a single BIMF.
 
@@ -371,7 +411,7 @@ class FABEMD:
 
         Parameters
         ----------
-        bimf : cp.ndarray
+        bimf : ndarray (cupy or numpy)
             A single BIMF (2-D array).
         bins : int
             Number of histogram bins.
@@ -383,7 +423,7 @@ class FABEMD:
         """
         data = bimf.ravel()
         # Move to CPU for histogram
-        data_cpu = data.get() if hasattr(data, "get") else np.asarray(data)
+        data_cpu = _to_numpy(data)
         hist, _ = np.histogram(data_cpu, bins=bins)
         # Normalise to probability
         p = hist / hist.sum()
@@ -393,7 +433,7 @@ class FABEMD:
 
     @staticmethod
     def calculate_all_entropies(
-        bimfs: List[cp.ndarray], bins: int = 256
+        bimfs: list, bins: int = 256
     ) -> List[float]:
         """Calculate Shannon entropy for every BIMF in the list."""
         return [FABEMD.calculate_entropy(b, bins=bins) for b in bimfs]
@@ -413,16 +453,18 @@ class FABEMD:
     # Residual accessor
     # ------------------------------------------------------------------
     def decompose_with_residual(
-        self, image: cp.ndarray
-    ) -> Tuple[List[cp.ndarray], cp.ndarray]:
+        self, image
+    ) -> Tuple[list, np.ndarray]:
         """
         Decompose and also return the final residue.
 
         Returns
         -------
-        bimfs : list of cp.ndarray
-        residual : cp.ndarray
+        bimfs : list of ndarray
+        residual : ndarray
         """
+        xp = _xp()
+        image = _to_xp(image)
         bimfs = self.decompose(image)
-        residual = image.astype(cp.float64) - sum(bimfs)
+        residual = image.astype(xp.float64) - sum(bimfs)
         return bimfs, residual
