@@ -31,8 +31,10 @@ Processing Modules:
 - FlatFieldCorrection: Flat field correction using GPU
 - SpatialCalibration: Lens distortion correction
 - BEMD: Bidimensional Empirical Mode Decomposition
-- HomomorphicFilter: Frequency domain filtering
+- HomomorphicFilter: Frequency domain filtering (Gaussian)
+- PACEHomomorphicFilter: Butterworth homomorphic filter (PACE, Siracusano 2020)
 - NonlinearFilter: Bilateral filtering and denoising
+- NLMeansFilter: Non-Local Means denoising (PACE 2.0, Siracusano 2023)
 - ImageEnhancer: Gamma correction and CLAHE
 - ImageMetrics: CII, entropy, and EME calculations
 - ImageResizer: GPU-accelerated image resizing
@@ -51,7 +53,9 @@ from .image_pipeline import (
     SpatialCalibration,
     BEMD,
     HomomorphicFilter,
+    PACEHomomorphicFilter,
     NonlinearFilter,
+    NLMeansFilter,
     ImageEnhancer,
     ImageMetrics,
     ImageResizer,
@@ -73,7 +77,9 @@ __all__ = [
     "SpatialCalibration",
     "BEMD",
     "HomomorphicFilter",
+    "PACEHomomorphicFilter",
     "NonlinearFilter",
+    "NLMeansFilter",
     "ImageEnhancer",
     "ImageMetrics",
     "ImageResizer",

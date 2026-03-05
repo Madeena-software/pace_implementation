@@ -112,6 +112,14 @@ class PipelineConfig:
     # Nonlinear filtering parameters
     denoise_r: int = 1
     denoise_beta: float = 0.5
+
+    # Denoising method: "bilateral" (original) or "nlmeans" (PACE 2.0)
+    denoise_method: str = "bilateral"
+
+    # NL-means parameters (used when denoise_method="nlmeans")
+    nlmeans_h: float = 10.0
+    nlmeans_template_window: int = 7
+    nlmeans_search_window: int = 21
     
     # FABEMD parameters (used when decomposition_method="fabemd")
     fabemd_max_sift_iterations: int = 10
@@ -124,6 +132,16 @@ class PipelineConfig:
 
     # Decomposition method: "bemd" or "fabemd"
     decomposition_method: str = "fabemd"
+
+    # Homomorphic filter method: "gaussian" (classic) or "butterworth" (PACE)
+    homomorphic_method: str = "gaussian"
+
+    # PACE Butterworth filter parameters
+    butterworth_order: int = 2
+    pace_d0_values: List[int] = field(default_factory=lambda: [20, 30, 40])
+    pace_gamma_h_values: List[float] = field(default_factory=lambda: [1.5, 2.0, 2.5])
+    pace_gamma_l_values: List[float] = field(default_factory=lambda: [0.3, 0.5])
+    pace_n_values: List[int] = field(default_factory=lambda: [1, 2])
 
     # Output parameters
     output_width: int = 4096
@@ -511,6 +529,106 @@ class HomomorphicFilter:
         return exp_image
 
 
+class PACEHomomorphicFilter:
+    """Homomorphic filter using Butterworth high-pass (PACE, Siracusano et al. 2020).
+
+    Unlike the Gaussian-based ``HomomorphicFilter``, this variant employs a
+    Butterworth high-pass transfer function which provides a sharper frequency
+    transition controlled by the filter order *n*:
+
+        H(u,v) = (γH − γL) × ────────────────────── + γL
+                                1 + (D0 / D(u,v))^(2n)
+
+    where D(u,v) is the distance from the frequency centre.
+
+    Reference
+    ---------
+    Siracusano, G. et al. "Pipeline for Advanced Contrast Enhancement (PACE)
+    of Chest X-ray in Evaluating COVID-19 Patients", J. Digit. Imaging, 2020.
+    """
+
+    def __init__(
+        self,
+        d0: float = 30,
+        gamma_h: float = 2.0,
+        gamma_l: float = 0.5,
+        n: int = 2,
+    ):
+        """
+        Initialise PACE homomorphic filter.
+
+        Args:
+            d0: Cutoff frequency of the Butterworth high-pass filter.
+            gamma_h: High-frequency gain (γH > 1 amplifies details).
+            gamma_l: Low-frequency gain (γL < 1 compresses illumination).
+            n: Order of the Butterworth filter (higher → sharper roll-off).
+        """
+        self.d0 = d0
+        self.gamma_h = gamma_h
+        self.gamma_l = gamma_l
+        self.n = n
+
+    def _butterworth_hpf(self, rows: int, cols: int) -> np.ndarray:
+        """Build a Butterworth high-pass filter matrix of shape (rows, cols)."""
+        u = np.arange(cols) - cols / 2
+        v = np.arange(rows) - rows / 2
+        U, V = np.meshgrid(u, v)
+        D = np.sqrt(U ** 2 + V ** 2)
+        # Avoid division by zero at DC
+        D[D == 0] = 1e-12
+        # Butterworth HPF: H_hp = 1 / (1 + (D0/D)^(2n))
+        H_hp = 1.0 / (1.0 + (self.d0 / D) ** (2 * self.n))
+        # Scale to [γL, γH]
+        H = (self.gamma_h - self.gamma_l) * H_hp + self.gamma_l
+        return H
+
+    def apply(self, image: Union[np.ndarray, "cp.ndarray"]) -> np.ndarray:
+        """Apply PACE homomorphic filter to a 2-D image.
+
+        Args:
+            image: Input image (numpy or cupy array, any numeric dtype).
+
+        Returns:
+            Filtered image normalised to uint16 [0, 65535].
+        """
+        img = _to_numpy(image).astype(np.float64)
+        rows, cols = img.shape
+
+        # 1. Logarithmic transform  (ln domain separates illumination × reflectance)
+        log_image = np.log1p(img)
+
+        # 2. Fourier transform
+        dft = cv2.dft(log_image, flags=cv2.DFT_COMPLEX_OUTPUT)
+        dft_shift = np.fft.fftshift(dft)
+
+        # 3. Build Butterworth high-pass filter and apply
+        H = self._butterworth_hpf(rows, cols)
+        H_2ch = np.repeat(H[:, :, np.newaxis], 2, axis=2)  # match complex channels
+        dft_filtered = dft_shift * H_2ch
+
+        # 4. Inverse Fourier transform
+        dft_filtered = np.fft.ifftshift(dft_filtered)
+        idft = cv2.idft(dft_filtered)
+        idft = cv2.magnitude(idft[:, :, 0], idft[:, :, 1])
+
+        # 5. Normalise before exponential to avoid overflow
+        idft = cv2.normalize(idft, None, 0, 1, cv2.NORM_MINMAX)
+
+        # 6. Exponential transform  (back from ln domain)
+        exp_image = np.expm1(idft)
+        exp_image = np.nan_to_num(exp_image, nan=0.0, posinf=65535.0, neginf=0.0)
+
+        # 7. Final normalisation to uint16
+        exp_image = cv2.normalize(exp_image, None, 0, 65535, cv2.NORM_MINMAX)
+        exp_image = np.uint16(exp_image)
+
+        # Cleanup
+        del img, log_image, dft, dft_shift, H, H_2ch, dft_filtered, idft
+        gc.collect()
+
+        return exp_image
+
+
 class NonlinearFilter:
     """Nonlinear filtering and denoising module."""
     
@@ -560,6 +678,122 @@ class NonlinearFilter:
             index = sorted_indices[j]
             I_E += _to_numpy(bimfs[index])
         
+        # Reconstruct with filtered residual
+        I_L = I_E + self.beta * filtered_residual
+        return I_L
+
+
+class NLMeansFilter:
+    """Non-Local Means denoising module (PACE 2.0, Siracusano et al. 2023).
+
+    Replaces bilateral filtering with NL-means, which exploits self-similarity
+    across the *entire* image rather than only local neighbourhoods.  For each
+    pixel the algorithm averages all pixels whose surrounding patch is similar,
+    weighted by the Gaussian-weighted patch distance:
+
+        NL[v](i) = Σ_j  w(i,j) · v(j)
+        w(i,j)   = (1/Z(i)) · exp( −‖v(N_i) − v(N_j)‖²_{2,a} / h² )
+
+    where *h* controls the degree of filtering.  This is particularly effective
+    on medical radiographs where repetitive anatomical textures exist.
+
+    Reference
+    ---------
+    Siracusano, G. et al. "Effective processing pipeline PACE 2.0 for
+    enhancing chest x-ray contrast and diagnostic interpretability",
+    Scientific Reports, 2023.
+    """
+
+    def __init__(
+        self,
+        r: int = 1,
+        beta: float = 0.5,
+        h: float = 10.0,
+        template_window_size: int = 7,
+        search_window_size: int = 21,
+    ):
+        """
+        Initialise NL-means filter.
+
+        Args:
+            r: Number of lowest-energy BIMFs to denoise.
+            beta: Weight for filtered residual in reconstruction.
+            h: Filter strength (higher removes more noise but may blur).
+            template_window_size: Size of the patch used for comparison (odd).
+            search_window_size: Size of the area searched for similar patches (odd).
+        """
+        self.r = r
+        self.beta = beta
+        self.h = h
+        self.template_window_size = template_window_size
+        self.search_window_size = search_window_size
+
+    def _nlmeans_denoise(self, image: np.ndarray) -> np.ndarray:
+        """Apply NL-means denoising to a single-channel image.
+
+        OpenCV's ``fastNlMeansDenoising`` expects uint8 or uint16.  We
+        normalise to uint16, denoise, then rescale back to the original range
+        so the filter integrates transparently with the rest of the pipeline.
+        """
+        img = image.astype(np.float32)
+        vmin, vmax = img.min(), img.max()
+        denom = vmax - vmin if vmax != vmin else 1.0
+
+        # Scale to uint16 for cv2.fastNlMeansDenoising
+        img_u16 = np.uint16(np.clip((img - vmin) / denom * 65535, 0, 65535))
+
+        # h is scaled relative to the uint16 range
+        h_scaled = self.h / 255.0 * 65535.0
+
+        denoised_u16 = cv2.fastNlMeansDenoising(
+            img_u16,
+            None,
+            h=h_scaled,
+            templateWindowSize=self.template_window_size,
+            searchWindowSize=self.search_window_size,
+        )
+
+        # Scale back to original range
+        denoised = denoised_u16.astype(np.float32) / 65535.0 * denom + vmin
+        return denoised
+
+    def denoise(
+        self,
+        bimfs: List,
+        energies: List[float],
+        filtered_residual: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Denoise and reconstruct image from BIMFs using NL-means.
+
+        The interface is identical to ``NonlinearFilter.denoise`` so both
+        classes are drop-in replaceable.
+
+        Args:
+            bimfs: List of BIMFs from BEMD / FABEMD.
+            energies: Energy values for each BIMF.
+            filtered_residual: Homomorphic-filtered residual image.
+
+        Returns:
+            Reconstructed image (float32/64 numpy array).
+        """
+        # Sort BIMFs by energy (lowest first)
+        sorted_indices = np.argsort(energies)
+
+        # Denoise the R lowest-energy BIMFs with NL-means
+        denoised_bimfs = []
+        for i in range(int(self.r)):
+            index = sorted_indices[i]
+            bimf_np = _to_numpy(bimfs[index]).astype(np.float32)
+            denoised = self._nlmeans_denoise(bimf_np)
+            denoised_bimfs.append(denoised)
+
+        # Sum denoised + remaining original BIMFs
+        I_E = np.sum(denoised_bimfs, axis=0)
+        for j in range(int(self.r), len(bimfs)):
+            index = sorted_indices[j]
+            I_E += _to_numpy(bimfs[index])
+
         # Reconstruct with filtered residual
         I_L = I_E + self.beta * filtered_residual
         return I_L
@@ -758,10 +992,20 @@ class ImageProcessingPipeline:
             window_size_cap=self.config.fabemd_window_size_cap,
             extrema_window=self.config.fabemd_extrema_window,
         )
-        self.nonlinear_filter = NonlinearFilter(
-            r=self.config.denoise_r,
-            beta=self.config.denoise_beta,
-        )
+        denoise_method = self.config.denoise_method.lower().strip()
+        if denoise_method == "nlmeans":
+            self.nonlinear_filter = NLMeansFilter(
+                r=self.config.denoise_r,
+                beta=self.config.denoise_beta,
+                h=self.config.nlmeans_h,
+                template_window_size=self.config.nlmeans_template_window,
+                search_window_size=self.config.nlmeans_search_window,
+            )
+        else:
+            self.nonlinear_filter = NonlinearFilter(
+                r=self.config.denoise_r,
+                beta=self.config.denoise_beta,
+            )
         self.enhancer = ImageEnhancer()
         self.metrics = ImageMetrics()
         self.resizer = ImageResizer()
@@ -879,10 +1123,16 @@ class ImageProcessingPipeline:
         energies: List[float]
     ) -> ProcessingResult:
         """Process image with single parameter combination."""
-        d0, rh, rl, gamma, clip_limit, tile_grid_size = params
-        
+        hom_method = self.config.homomorphic_method.lower().strip()
+
+        if hom_method == "butterworth":
+            d0, gamma_h, gamma_l, bw_n, gamma, clip_limit, tile_grid_size = params
+            hf = PACEHomomorphicFilter(d0=d0, gamma_h=gamma_h, gamma_l=gamma_l, n=bw_n)
+        else:
+            d0, rh, rl, gamma, clip_limit, tile_grid_size = params
+            hf = HomomorphicFilter(d0=d0, rh=rh, rl=rl)
+
         # Apply homomorphic filter
-        hf = HomomorphicFilter(d0=d0, rh=rh, rl=rl)
         filtered_image = hf.apply(reference_image)
         
         # Reconstruct image
@@ -932,14 +1182,26 @@ class ImageProcessingPipeline:
         logger.info("Finding best parameters...")
         
         # Generate parameter combinations
-        parameter_combinations = list(itertools.product(
-            self.config.d0_values,
-            self.config.rh_values,
-            self.config.rl_values,
-            self.config.gamma_values,
-            self.config.clip_limit_values,
-            self.config.tile_grid_size_values,
-        ))
+        hom_method = self.config.homomorphic_method.lower().strip()
+        if hom_method == "butterworth":
+            parameter_combinations = list(itertools.product(
+                self.config.pace_d0_values,
+                self.config.pace_gamma_h_values,
+                self.config.pace_gamma_l_values,
+                self.config.pace_n_values,
+                self.config.gamma_values,
+                self.config.clip_limit_values,
+                self.config.tile_grid_size_values,
+            ))
+        else:
+            parameter_combinations = list(itertools.product(
+                self.config.d0_values,
+                self.config.rh_values,
+                self.config.rl_values,
+                self.config.gamma_values,
+                self.config.clip_limit_values,
+                self.config.tile_grid_size_values,
+            ))
         
         logger.info(f"Total parameter combinations: {len(parameter_combinations)}")
         
