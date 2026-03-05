@@ -474,59 +474,60 @@ class HomomorphicFilter:
     def apply(self, image: Union[np.ndarray, cp.ndarray]) -> np.ndarray:
         """
         Apply homomorphic filter to image.
-        
+
+        Pipeline:  image → ln → FFT → H(u,v) → IFFT → exp → result
+
         Args:
             image: Input image.
             
         Returns:
-            Filtered image as uint16.
+            Filtered image as float64 with corrected illumination.
         """
         if not isinstance(image, np.ndarray):
             img = _to_numpy(image)
         else:
-            img = image
-        
+            img = image.copy()
+        img = img.astype(np.float64)
         rows, cols = img.shape
+
+        # Ensure strictly positive values for log
+        img = np.maximum(img, 1e-10)
         
         # Logarithmic transform
-        log_image = np.log1p(img)
+        log_image = np.log(img)
         
-        # Fourier transform
-        dft = cv2.dft(log_image, flags=cv2.DFT_COMPLEX_OUTPUT)
-        dft_shift = np.fft.fftshift(dft)
+        # Fourier transform (numpy complex FFT)
+        F = np.fft.fft2(log_image)
+        F_shift = np.fft.fftshift(F)
         
-        # Create high-frequency emphasis filter
-        u = np.arange(cols)
-        v = np.arange(rows)
-        u, v = np.meshgrid(u - rows / 2, v - cols / 2)
-        d = np.sqrt(u ** 2 + v ** 2)
-        h = (self.rh - self.rl) * (1 - np.exp(-self.c * (d ** 2 / self.d0 ** 2))) + self.rl
-        h = np.repeat(h[:, :, np.newaxis], 2, axis=2)
+        # Create Gaussian high-frequency emphasis filter
+        u = np.arange(cols) - cols / 2
+        v = np.arange(rows) - rows / 2
+        U, V = np.meshgrid(u, v)
+        d = np.sqrt(U ** 2 + V ** 2)
+        H = (self.rh - self.rl) * (1 - np.exp(-self.c * (d ** 2 / self.d0 ** 2))) + self.rl
         
         # Apply filter
-        dft_shift_filtered = dft_shift * h
+        F_filtered = F_shift * H
         
-        # Inverse Fourier transform
-        dft_shift_filtered = np.fft.ifftshift(dft_shift_filtered)
-        idft = cv2.idft(dft_shift_filtered)
-        idft = cv2.magnitude(idft[:, :, 0], idft[:, :, 1])
+        # Inverse FFT — take real part
+        filtered_log = np.real(np.fft.ifft2(np.fft.ifftshift(F_filtered)))
         
-        # Normalize
-        idft = cv2.normalize(idft, None, 0, 1, cv2.NORM_MINMAX)
-        
-        # Exponential transform
-        exp_image = np.expm1(idft)
-        exp_image = np.nan_to_num(exp_image, nan=0.0, posinf=65535.0, neginf=0.0)
-        
-        # Final normalization
-        exp_image = cv2.normalize(exp_image, None, 0, 65535, cv2.NORM_MINMAX)
-        exp_image = np.uint16(exp_image)
+        # Exponential transform (back from log domain)
+        result = np.exp(filtered_log)
+
+        # Normalise to [0, 1]
+        rmin, rmax = result.min(), result.max()
+        if rmax - rmin > 1e-10:
+            result = (result - rmin) / (rmax - rmin)
+        else:
+            result = np.zeros_like(result)
         
         # Cleanup
-        del img, log_image, dft, dft_shift, u, v, d, h, dft_shift_filtered, idft
+        del img, log_image, F, F_shift, u, v, U, V, d, H, F_filtered, filtered_log
         gc.collect()
         
-        return exp_image
+        return result
 
 
 class PACEHomomorphicFilter:
@@ -585,48 +586,56 @@ class PACEHomomorphicFilter:
     def apply(self, image: Union[np.ndarray, "cp.ndarray"]) -> np.ndarray:
         """Apply PACE homomorphic filter to a 2-D image.
 
+        The classic homomorphic pipeline:
+            image  →  ln  →  FFT  →  H(u,v)  →  IFFT  →  exp  →  result
+
+        In the log domain, illumination (low-freq) and reflectance (high-freq)
+        are additive.  The Butterworth HPF attenuates illumination (×γL < 1)
+        while preserving / boosting reflectance (×γH ≥ 1), producing
+        **homogeneous lighting** on the residual (see PACE paper, Fig. 3).
+
         Args:
             image: Input image (numpy or cupy array, any numeric dtype).
 
         Returns:
-            Filtered image normalised to uint16 [0, 65535].
+            Filtered image as float64 with corrected illumination.
         """
         img = _to_numpy(image).astype(np.float64)
         rows, cols = img.shape
 
-        # 1. Logarithmic transform  (ln domain separates illumination × reflectance)
-        log_image = np.log1p(img)
+        # 1. Ensure strictly positive values for log transform
+        img = np.maximum(img, 1e-10)
 
-        # 2. Fourier transform
-        dft = cv2.dft(log_image, flags=cv2.DFT_COMPLEX_OUTPUT)
-        dft_shift = np.fft.fftshift(dft)
+        # 2. Logarithmic transform  (separates illumination × reflectance)
+        log_image = np.log(img)
 
-        # 3. Build Butterworth high-pass filter and apply
+        # 3. FFT (numpy handles complex numbers natively)
+        F = np.fft.fft2(log_image)
+        F_shift = np.fft.fftshift(F)
+
+        # 4. Build Butterworth high-pass filter and apply
         H = self._butterworth_hpf(rows, cols)
-        H_2ch = np.repeat(H[:, :, np.newaxis], 2, axis=2)  # match complex channels
-        dft_filtered = dft_shift * H_2ch
+        F_filtered = F_shift * H
 
-        # 4. Inverse Fourier transform
-        dft_filtered = np.fft.ifftshift(dft_filtered)
-        idft = cv2.idft(dft_filtered)
-        idft = cv2.magnitude(idft[:, :, 0], idft[:, :, 1])
+        # 5. Inverse FFT — take real part (imaginary ≈ 0 for real input)
+        F_filtered = np.fft.ifftshift(F_filtered)
+        filtered_log = np.real(np.fft.ifft2(F_filtered))
 
-        # 5. Normalise before exponential to avoid overflow
-        idft = cv2.normalize(idft, None, 0, 1, cv2.NORM_MINMAX)
+        # 6. Exponential transform  (back from log domain)
+        result = np.exp(filtered_log)
 
-        # 6. Exponential transform  (back from ln domain)
-        exp_image = np.expm1(idft)
-        exp_image = np.nan_to_num(exp_image, nan=0.0, posinf=65535.0, neginf=0.0)
-
-        # 7. Final normalisation to uint16
-        exp_image = cv2.normalize(exp_image, None, 0, 65535, cv2.NORM_MINMAX)
-        exp_image = np.uint16(exp_image)
+        # 7. Normalise to [0, 1] for downstream compatibility
+        rmin, rmax = result.min(), result.max()
+        if rmax - rmin > 1e-10:
+            result = (result - rmin) / (rmax - rmin)
+        else:
+            result = np.zeros_like(result)
 
         # Cleanup
-        del img, log_image, dft, dft_shift, H, H_2ch, dft_filtered, idft
+        del img, log_image, F, F_shift, H, F_filtered, filtered_log
         gc.collect()
 
-        return exp_image
+        return result
 
 
 class NonlinearFilter:
@@ -731,30 +740,28 @@ class NLMeansFilter:
     def _nlmeans_denoise(self, image: np.ndarray) -> np.ndarray:
         """Apply NL-means denoising to a single-channel image.
 
-        OpenCV's ``fastNlMeansDenoising`` expects uint8 or uint16.  We
-        normalise to uint16, denoise, then rescale back to the original range
-        so the filter integrates transparently with the rest of the pipeline.
+        OpenCV's ``fastNlMeansDenoising`` with NORM_L2 only supports uint8.
+        We normalise to uint8, denoise, then rescale back to the original
+        range so the filter integrates transparently with the rest of the
+        pipeline.
         """
         img = image.astype(np.float32)
         vmin, vmax = img.min(), img.max()
         denom = vmax - vmin if vmax != vmin else 1.0
 
-        # Scale to uint16 for cv2.fastNlMeansDenoising
-        img_u16 = np.uint16(np.clip((img - vmin) / denom * 65535, 0, 65535))
+        # Scale to uint8 for cv2.fastNlMeansDenoising (NORM_L2 requirement)
+        img_u8 = np.uint8(np.clip((img - vmin) / denom * 255, 0, 255))
 
-        # h is scaled relative to the uint16 range
-        h_scaled = self.h / 255.0 * 65535.0
-
-        denoised_u16 = cv2.fastNlMeansDenoising(
-            img_u16,
+        denoised_u8 = cv2.fastNlMeansDenoising(
+            img_u8,
             None,
-            h=h_scaled,
+            h=self.h,
             templateWindowSize=self.template_window_size,
             searchWindowSize=self.search_window_size,
         )
 
         # Scale back to original range
-        denoised = denoised_u16.astype(np.float32) / 65535.0 * denom + vmin
+        denoised = denoised_u8.astype(np.float32) / 255.0 * denom + vmin
         return denoised
 
     def denoise(
@@ -808,14 +815,20 @@ class ImageEnhancer:
         Apply gamma correction.
         
         Args:
-            image: Input image.
+            image: Input image (float or uint16).
             gamma: Gamma value (< 1 brightens, > 1 darkens).
             
         Returns:
-            Gamma-corrected image.
+            Gamma-corrected image as uint16.
         """
-        img_normalized = image / 65535.0
-        img_corrected = np.power(img_normalized, gamma)
+        img = image.astype(np.float64)
+        # Normalise to [0, 1] regardless of input range/dtype
+        imin, imax = img.min(), img.max()
+        if imax - imin > 1e-10:
+            img_normalized = (img - imin) / (imax - imin)
+        else:
+            img_normalized = np.zeros_like(img)
+        img_corrected = np.power(np.clip(img_normalized, 0, 1), gamma)
         return np.uint16(img_corrected * 65535)
     
     @staticmethod
