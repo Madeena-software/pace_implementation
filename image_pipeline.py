@@ -129,6 +129,7 @@ class PipelineConfig:
     fabemd_window_size_cap: int = 201
     fabemd_extrema_window: int = 3
     fabemd_initial_window_size: Optional[int] = None
+    fabemd_window_growth_rate: float = 1.5
 
     # Decomposition method: "bemd" or "fabemd"
     decomposition_method: str = "fabemd"
@@ -1004,6 +1005,7 @@ class ImageProcessingPipeline:
             initial_window_size=self.config.fabemd_initial_window_size,
             window_size_cap=self.config.fabemd_window_size_cap,
             extrema_window=self.config.fabemd_extrema_window,
+            window_growth_rate=self.config.fabemd_window_growth_rate,
         )
         denoise_method = self.config.denoise_method.lower().strip()
         if denoise_method == "nlmeans":

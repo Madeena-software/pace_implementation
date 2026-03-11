@@ -116,6 +116,10 @@ class FABEMD:
         large filters on sparse extrema distributions.
     extrema_window : int
         Neighbourhood size used when detecting local maxima/minima.
+    window_growth_rate : float
+        Maximum factor by which the window size can grow between
+        consecutive BIMFs (default 1.5 = at most 50% larger each step).
+        Prevents abrupt jumps from small to very large windows.
     """
 
     def __init__(
@@ -127,6 +131,7 @@ class FABEMD:
         initial_window_size: Optional[int] = None,
         window_size_cap: int = 201,
         extrema_window: int = 3,
+        window_growth_rate: float = 1.5,
     ):
         self.max_sift_iterations = max_sift_iterations
         self.sd_threshold = sd_threshold
@@ -135,6 +140,7 @@ class FABEMD:
         self.initial_window_size = initial_window_size
         self.window_size_cap = window_size_cap
         self.extrema_window = extrema_window
+        self.window_growth_rate = window_growth_rate
 
     # ------------------------------------------------------------------
     # Extrema detection
@@ -311,6 +317,12 @@ class FABEMD:
         -------
         bimfs : list of ndarray
             Extracted BIMFs ordered from highest to lowest frequency.
+
+        Notes
+        -----
+        After decomposition, ``self.window_sizes_`` contains the
+        (w_upper, w_lower) pairs used for each extracted BIMF, which
+        reflects the adaptive window progression from fine to coarse.
         """
         xp = _xp()
         logger.info("Starting FABEMD decomposition...")
@@ -318,11 +330,18 @@ class FABEMD:
         image = _to_xp(image)
         residual = image.astype(xp.float64)
         bimfs: list = []
+        self.window_sizes_: List[Tuple[int, int]] = []
+
+        # Monotonic window floor — ensures windows grow from fine to coarse
+        prev_w_upper = 3
+        prev_w_lower = 3
 
         while len(bimfs) < self.max_bimfs:
             h = residual.copy()
             sd_limit = self.sd_threshold
             accepted = False
+            last_w_upper = prev_w_upper
+            last_w_lower = prev_w_lower
 
             for j in range(self.max_sift_iterations):
                 # 1. Detect extrema
@@ -341,6 +360,25 @@ class FABEMD:
                     w_lower = self._compute_adaptive_window_size(
                         min_map, h.shape, cap=self.window_size_cap
                     )
+
+                # Enforce monotonic growth: never shrink below previous BIMF
+                w_upper = max(w_upper, prev_w_upper)
+                w_lower = max(w_lower, prev_w_lower)
+
+                # Cap growth rate to prevent huge jumps between BIMFs
+                max_w_upper = max(int(prev_w_upper * self.window_growth_rate), prev_w_upper + 2)
+                max_w_lower = max(int(prev_w_lower * self.window_growth_rate), prev_w_lower + 2)
+                w_upper = min(w_upper, max_w_upper)
+                w_lower = min(w_lower, max_w_lower)
+
+                # Keep odd
+                if w_upper % 2 == 0:
+                    w_upper += 1
+                if w_lower % 2 == 0:
+                    w_lower += 1
+
+                last_w_upper = w_upper
+                last_w_lower = w_lower
 
                 # 3. Estimate envelopes
                 upper_env = self._estimate_envelope(h, w_upper, "max")
@@ -367,11 +405,19 @@ class FABEMD:
                 bimfs.append(h)
                 residual = residual - h
 
+            self.window_sizes_.append((last_w_upper, last_w_lower))
+
+            # Raise the floor for the next BIMF
+            prev_w_upper = last_w_upper
+            prev_w_lower = last_w_lower
+
             # 6. Check stopping criteria on residual
             max_map, min_map = self._find_local_extrema(residual)
             n_extrema = int(xp.sum(max_map) + xp.sum(min_map))
+            w_avg = (last_w_upper + last_w_lower) // 2
             print(
                 f"\rFABEMD: {len(bimfs)} BIMFs | "
+                f"window={w_avg} | "
                 f"residual extrema: {n_extrema}",
                 end="",
             )
@@ -391,6 +437,125 @@ class FABEMD:
             f"FABEMD decomposition completed — {len(bimfs)} BIMFs extracted."
         )
         return bimfs
+
+    # ------------------------------------------------------------------
+    # Semantic grouping of BIMFs
+    # ------------------------------------------------------------------
+    def classify_bimfs(
+        self,
+        bimfs: list,
+        image_shape: Optional[Tuple[int, int]] = None,
+    ) -> dict:
+        """
+        Classify BIMFs into semantic groups based on the adaptive window
+        sizes recorded during decomposition.
+
+        Groups:
+            - **edges**: BIMFs extracted with small windows (high frequency)
+              — captures sharp transitions and fine edges.
+            - **detail**: BIMFs extracted with medium windows
+              — captures texture and mid-scale structures.
+            - **contrast**: BIMFs extracted with large windows (low frequency)
+              — captures broad illumination and contrast variations.
+
+        Window-size boundaries are set relative to the image's shortest
+        dimension:
+            - edges:    window ≤ 5% of min(H, W)
+            - detail:   5% < window ≤ 20% of min(H, W)
+            - contrast: window > 20% of min(H, W)
+
+        Parameters
+        ----------
+        bimfs : list of ndarray
+            BIMFs returned by ``decompose``.
+        image_shape : tuple of int, optional
+            (H, W) of the original image.  If *None*, inferred from
+            the first BIMF's shape.
+
+        Returns
+        -------
+        groups : dict
+            ``{"edges": list, "detail": list, "contrast": list,
+              "indices": {"edges": list[int], "detail": list[int],
+                          "contrast": list[int]},
+              "window_sizes": list[tuple]}``
+        """
+        if not hasattr(self, "window_sizes_") or len(self.window_sizes_) == 0:
+            raise RuntimeError(
+                "No window size data available. "
+                "Run decompose() before classify_bimfs()."
+            )
+
+        if image_shape is None:
+            image_shape = _to_numpy(bimfs[0]).shape[:2]
+
+        min_dim = min(image_shape)
+        edge_thresh = max(5, int(min_dim * 0.05)) | 1    # ≤5% → edges
+        detail_thresh = max(11, int(min_dim * 0.20)) | 1  # ≤20% → detail
+
+        edges_idx, detail_idx, contrast_idx = [], [], []
+
+        for i, (wu, wl) in enumerate(self.window_sizes_):
+            if i >= len(bimfs):
+                break
+            w_avg = (wu + wl) / 2.0
+            if w_avg <= edge_thresh:
+                edges_idx.append(i)
+            elif w_avg <= detail_thresh:
+                detail_idx.append(i)
+            else:
+                contrast_idx.append(i)
+
+        return {
+            "edges": [bimfs[i] for i in edges_idx],
+            "detail": [bimfs[i] for i in detail_idx],
+            "contrast": [bimfs[i] for i in contrast_idx],
+            "indices": {
+                "edges": edges_idx,
+                "detail": detail_idx,
+                "contrast": contrast_idx,
+            },
+            "window_sizes": list(self.window_sizes_),
+        }
+
+    def decompose_semantic(
+        self, image
+    ) -> dict:
+        """
+        Decompose an image and return BIMFs grouped semantically.
+
+        Convenience wrapper around ``decompose`` + ``classify_bimfs``
+        that also computes the residue.
+
+        Returns
+        -------
+        result : dict
+            ``{"edges": ndarray, "detail": ndarray,
+              "contrast": ndarray, "residue": ndarray,
+              "bimfs": list, "groups": dict}``
+
+            The ``edges``, ``detail``, and ``contrast`` arrays are the
+            pixel-wise sum of their respective BIMF groups.
+        """
+        xp = _xp()
+        image = _to_xp(image)
+        bimfs = self.decompose(image)
+        residual = image.astype(xp.float64) - sum(bimfs)
+        groups = self.classify_bimfs(bimfs, image_shape=image.shape[:2])
+
+        def _sum_group(group_list):
+            if len(group_list) == 0:
+                return xp.zeros_like(residual)
+            return sum(group_list)
+
+        return {
+            "edges": _sum_group(groups["edges"]),
+            "detail": _sum_group(groups["detail"]),
+            "contrast": _sum_group(groups["contrast"]),
+            "residue": residual,
+            "bimfs": bimfs,
+            "groups": groups,
+        }
 
     # ------------------------------------------------------------------
     # Utility methods (compatible with BEMD interface)
