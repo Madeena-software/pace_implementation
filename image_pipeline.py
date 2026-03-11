@@ -1104,7 +1104,7 @@ class ImageProcessingPipeline:
     
     def decompose_image(
         self, image: np.ndarray, method: Optional[str] = None
-    ) -> Tuple[List[cp.ndarray], List[float]]:
+    ) -> Tuple[List[cp.ndarray], List[float], Optional[np.ndarray]]:
         """
         Decompose image using BEMD or FABEMD.
 
@@ -1113,29 +1113,32 @@ class ImageProcessingPipeline:
             method: "bemd" or "fabemd". Defaults to config.decomposition_method.
 
         Returns:
-            Tuple of (BIMFs, energies).
+            Tuple of (BIMFs, energies, residue).  residue is None for BEMD.
         """
         method = (method or self.config.decomposition_method).lower().strip()
         gpu_image = cp.asarray(image)
 
+        residue = None
         if method == "fabemd":
             logger.info("Starting image decomposition (FABEMD)...")
-            bimfs = self.fabemd.decompose(gpu_image)
+            bimfs, residue_gpu = self.fabemd.decompose_with_residual(gpu_image)
             energies = FABEMD.calculate_energies(bimfs)
+            residue = _to_numpy(residue_gpu)
         else:
             logger.info("Starting image decomposition (BEMD)...")
             bimfs = self.bemd.decompose(gpu_image)
             energies = BEMD.calculate_energies(bimfs)
 
         logger.info("Image decomposition completed.")
-        return bimfs, energies
+        return bimfs, energies, residue
     
     def _process_single_params(
         self,
         params: Tuple,
         reference_image: np.ndarray,
         bimfs: List[cp.ndarray],
-        energies: List[float]
+        energies: List[float],
+        residue: Optional[np.ndarray] = None
     ) -> ProcessingResult:
         """Process image with single parameter combination."""
         hom_method = self.config.homomorphic_method.lower().strip()
@@ -1147,8 +1150,9 @@ class ImageProcessingPipeline:
             d0, rh, rl, gamma, clip_limit, tile_grid_size = params
             hf = HomomorphicFilter(d0=d0, rh=rh, rl=rl)
 
-        # Apply homomorphic filter
-        filtered_image = hf.apply(reference_image)
+        # Apply homomorphic filter to residue (FABEMD) or reference image (BEMD)
+        hom_input = residue if residue is not None else reference_image
+        filtered_image = hf.apply(hom_input)
         
         # Reconstruct image
         reconstructed = self.nonlinear_filter.denoise(bimfs, energies, filtered_image)
@@ -1181,7 +1185,8 @@ class ImageProcessingPipeline:
         self,
         reference_image: np.ndarray,
         bimfs: List[cp.ndarray],
-        energies: List[float]
+        energies: List[float],
+        residue: Optional[np.ndarray] = None
     ) -> ProcessingResult:
         """
         Find best processing parameters through grid search.
@@ -1226,7 +1231,7 @@ class ImageProcessingPipeline:
             futures = [
                 executor.submit(
                     self._process_single_params,
-                    params, reference_image, bimfs, energies
+                    params, reference_image, bimfs, energies, residue
                 )
                 for params in parameter_combinations
             ]
@@ -1339,10 +1344,10 @@ class ImageProcessingPipeline:
                 calibrated_img = self.apply_spatial_calibration(ffc_img, calibration_path)
             
             # Decompose image
-            bimfs, energies = self.decompose_image(calibrated_img)
+            bimfs, energies, residue = self.decompose_image(calibrated_img)
             
             # Find best parameters
-            best_result = self.find_best_parameters(calibrated_img, bimfs, energies)
+            best_result = self.find_best_parameters(calibrated_img, bimfs, energies, residue)
             
             # Normalize and resize
             final_image = self.normalize_and_resize(best_result.image)
