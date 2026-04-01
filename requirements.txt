@@ -1,0 +1,8 @@
+# Core dependencies for the PACE image processing pipeline
+numpy
+opencv-python
+scipy
+matplotlib
+
+# Optional GPU acceleration (install only if your CUDA setup supports it)
+# cupy-cuda12x
