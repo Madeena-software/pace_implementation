@@ -11,6 +11,16 @@
     "bemd_threshold": 1.0,
     "bemd_initial_window_size": 32,
     "bemd_local_extrema_count": 10,
+
+    "decomposition_method": "fabemd",
+    "fabemd_max_sift_iterations": 10,
+    "fabemd_sd_threshold": 0.2,
+    "fabemd_min_extrema": 5,
+    "fabemd_max_bimfs": 100,
+    "fabemd_window_size_cap": 201,
+    "fabemd_extrema_window": 3,
+    "fabemd_initial_window_size": null,
+    "fabemd_window_growth_rate": 1.5,
     
     "d0_values": [20, 30, 40],
     "rh_values": [1.5, 2.0, 2.5],

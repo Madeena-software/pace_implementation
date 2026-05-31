@@ -69,12 +69,42 @@ def _input_yes_no(prompt: str, default: bool = True) -> bool:
 # =============================================================================
 
 def _get_common_config() -> dict:
-    """Gather BEMD, enhancement, and output parameters from the user."""
-    print("\n--- BEMD Parameters ---")
-    bemd_max_iterations = _input_int("  Max iterations", 1)
-    bemd_threshold = _input_float("  Threshold", 1.0)
-    bemd_initial_window_size = _input_int("  Initial window size", 32)
-    bemd_local_extrema_count = _input_int("  Local extrema count", 10)
+    """Gather decomposition, enhancement, and output parameters from the user."""
+    print("\n--- Decomposition Parameters ---")
+    decomposition_method = _input_str("  Method (bemd/fabemd)", "fabemd").lower().strip()
+    if decomposition_method not in ("bemd", "fabemd"):
+        decomposition_method = "fabemd"
+
+    bemd_max_iterations = 1
+    bemd_threshold = 1.0
+    bemd_initial_window_size = 32
+    bemd_local_extrema_count = 10
+    fabemd_max_sift_iterations = 10
+    fabemd_sd_threshold = 0.2
+    fabemd_min_extrema = 5
+    fabemd_max_bimfs = 100
+    fabemd_window_size_cap = 201
+    fabemd_extrema_window = 3
+    fabemd_initial_window_size = None
+    fabemd_window_growth_rate = 1.5
+
+    if decomposition_method == "bemd":
+        print("\n--- BEMD Parameters ---")
+        bemd_max_iterations = _input_int("  Max iterations", 1)
+        bemd_threshold = _input_float("  Threshold", 1.0)
+        bemd_initial_window_size = _input_int("  Initial window size", 32)
+        bemd_local_extrema_count = _input_int("  Local extrema count", 10)
+    else:
+        print("\n--- FABEMD Parameters ---")
+        fabemd_max_sift_iterations = _input_int("  Max sift iterations", 10)
+        fabemd_sd_threshold = _input_float("  SD threshold", 0.2)
+        fabemd_min_extrema = _input_int("  Min extrema", 5)
+        fabemd_max_bimfs = _input_int("  Max BIMFs", 100)
+        fabemd_window_size_cap = _input_int("  Window size cap", 201)
+        fabemd_extrema_window = _input_int("  Extrema window", 3)
+        initial_window = _input_int("  Initial window size (0 = adaptive)", 0)
+        fabemd_initial_window_size = initial_window if initial_window > 0 else None
+        fabemd_window_growth_rate = _input_float("  Window growth rate", 1.5)
 
     print("\n--- Parameter Search Ranges ---")
     d0_values = _input_int_list("  D0 values (comma-separated)", [20, 30, 40])
@@ -93,6 +123,15 @@ def _get_common_config() -> dict:
         bemd_threshold=bemd_threshold,
         bemd_initial_window_size=bemd_initial_window_size,
         bemd_local_extrema_count=bemd_local_extrema_count,
+        decomposition_method=decomposition_method,
+        fabemd_max_sift_iterations=fabemd_max_sift_iterations,
+        fabemd_sd_threshold=fabemd_sd_threshold,
+        fabemd_min_extrema=fabemd_min_extrema,
+        fabemd_max_bimfs=fabemd_max_bimfs,
+        fabemd_window_size_cap=fabemd_window_size_cap,
+        fabemd_extrema_window=fabemd_extrema_window,
+        fabemd_initial_window_size=fabemd_initial_window_size,
+        fabemd_window_growth_rate=fabemd_window_growth_rate,
         d0_values=d0_values,
         rh_values=rh_values,
         rl_values=rl_values,

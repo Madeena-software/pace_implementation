@@ -150,6 +150,12 @@ class PipelineConfig:
 
     # Processing mode: "full" (with FFC + spatial calibration) or "pace" (skip both)
     processing_mode: str = "full"
+
+    # Keep pixels that are zero in the calibrated/reference image black after
+    # enhancement. This prevents decomposition/gamma/CLAHE from lifting the
+    # invalid background outside the detector field.
+    preserve_zero_background: bool = True
+    background_zero_threshold: float = 0.0
     
     @classmethod
     def from_json(cls, filepath: str) -> "PipelineConfig":
@@ -472,7 +478,11 @@ class HomomorphicFilter:
         self.rl = rl
         self.c = c
     
-    def apply(self, image: Union[np.ndarray, cp.ndarray]) -> np.ndarray:
+    def apply(
+        self,
+        image: Union[np.ndarray, cp.ndarray],
+        normalize: bool = True,
+    ) -> np.ndarray:
         """
         Apply homomorphic filter to image.
 
@@ -480,6 +490,7 @@ class HomomorphicFilter:
 
         Args:
             image: Input image.
+            normalize: If True, scale the filtered result to [0, 1].
             
         Returns:
             Filtered image as float64 with corrected illumination.
@@ -491,8 +502,15 @@ class HomomorphicFilter:
         img = img.astype(np.float64)
         rows, cols = img.shape
 
-        # Ensure strictly positive values for log
-        img = np.maximum(img, 1e-10)
+        # Homomorphic filtering needs a strictly positive signal before log.
+        # FABEMD residues are usually positive luminance backgrounds, but a
+        # signed residue can occur; shifting preserves its relative structure
+        # instead of collapsing all non-positive pixels to one tiny constant.
+        min_img = float(np.min(img))
+        if min_img <= 0:
+            img = img - min_img + 1e-10
+        else:
+            img = np.maximum(img, 1e-10)
         
         # Logarithmic transform
         log_image = np.log(img)
@@ -517,12 +535,13 @@ class HomomorphicFilter:
         # Exponential transform (back from log domain)
         result = np.exp(filtered_log)
 
-        # Normalise to [0, 1]
-        rmin, rmax = result.min(), result.max()
-        if rmax - rmin > 1e-10:
-            result = (result - rmin) / (rmax - rmin)
-        else:
-            result = np.zeros_like(result)
+        if normalize:
+            # Normalise to [0, 1] for display/direct filter use.
+            rmin, rmax = result.min(), result.max()
+            if rmax - rmin > 1e-10:
+                result = (result - rmin) / (rmax - rmin)
+            else:
+                result = np.zeros_like(result)
         
         # Cleanup
         del img, log_image, F, F_shift, u, v, U, V, d, H, F_filtered, filtered_log
@@ -584,7 +603,11 @@ class PACEHomomorphicFilter:
         H = (self.gamma_h - self.gamma_l) * H_hp + self.gamma_l
         return H
 
-    def apply(self, image: Union[np.ndarray, "cp.ndarray"]) -> np.ndarray:
+    def apply(
+        self,
+        image: Union[np.ndarray, "cp.ndarray"],
+        normalize: bool = True,
+    ) -> np.ndarray:
         """Apply PACE homomorphic filter to a 2-D image.
 
         The classic homomorphic pipeline:
@@ -597,6 +620,7 @@ class PACEHomomorphicFilter:
 
         Args:
             image: Input image (numpy or cupy array, any numeric dtype).
+            normalize: If True, scale the filtered result to [0, 1].
 
         Returns:
             Filtered image as float64 with corrected illumination.
@@ -625,12 +649,13 @@ class PACEHomomorphicFilter:
         # 6. Exponential transform  (back from log domain)
         result = np.exp(filtered_log)
 
-        # 7. Normalise to [0, 1] for downstream compatibility
-        rmin, rmax = result.min(), result.max()
-        if rmax - rmin > 1e-10:
-            result = (result - rmin) / (rmax - rmin)
-        else:
-            result = np.zeros_like(result)
+        if normalize:
+            # 7. Normalise to [0, 1] for display/direct filter use.
+            rmin, rmax = result.min(), result.max()
+            if rmax - rmin > 1e-10:
+                result = (result - rmin) / (rmax - rmin)
+            else:
+                result = np.zeros_like(result)
 
         # Cleanup
         del img, log_image, F, F_shift, H, F_filtered, filtered_log
@@ -1131,6 +1156,30 @@ class ImageProcessingPipeline:
 
         logger.info("Image decomposition completed.")
         return bimfs, energies, residue
+
+    def _reference_background_mask(self, reference_image: np.ndarray) -> Optional[np.ndarray]:
+        """Return the invalid/background mask from the reference image."""
+        if not self.config.preserve_zero_background:
+            return None
+
+        threshold = float(self.config.background_zero_threshold)
+        reference = _to_numpy(reference_image)
+        if threshold > 0:
+            mask = reference <= threshold
+        else:
+            mask = reference == 0
+
+        return mask if np.any(mask) else None
+
+    @staticmethod
+    def _zero_background(image: np.ndarray, background_mask: Optional[np.ndarray]) -> np.ndarray:
+        """Force masked background pixels to zero without mutating the caller's array."""
+        if background_mask is None:
+            return image
+
+        image = np.array(image, copy=True)
+        image[background_mask] = 0
+        return image
     
     def _process_single_params(
         self,
@@ -1150,18 +1199,22 @@ class ImageProcessingPipeline:
             d0, rh, rl, gamma, clip_limit, tile_grid_size = params
             hf = HomomorphicFilter(d0=d0, rh=rh, rl=rl)
 
+        background_mask = self._reference_background_mask(reference_image)
+
         # Apply homomorphic filter to residue (FABEMD) or reference image (BEMD)
         hom_input = residue if residue is not None else reference_image
-        filtered_image = hf.apply(hom_input)
+        filtered_image = hf.apply(hom_input, normalize=False)
         
         # Reconstruct image
         reconstructed = self.nonlinear_filter.denoise(bimfs, energies, filtered_image)
         
         # Apply gamma correction
         gamma_corrected = self.enhancer.gamma_correction(reconstructed, gamma)
+        gamma_corrected = self._zero_background(gamma_corrected, background_mask)
         
         # Apply CLAHE
         clahe_image = self.enhancer.apply_clahe(gamma_corrected, clip_limit, tile_grid_size)
+        clahe_image = self._zero_background(clahe_image, background_mask)
         
         # Calculate metrics
         mask = np.ones_like(reference_image)

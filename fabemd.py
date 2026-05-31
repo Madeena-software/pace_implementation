@@ -109,8 +109,9 @@ class FABEMD:
     max_bimfs : int
         Hard limit on the number of BIMFs to extract.
     initial_window_size : int or None
-        If given, use a fixed window size instead of adaptive computation
-        (useful for reproducibility / speed).
+        If given, use this as the starting window floor for FABEMD after
+        odd-size/clamp normalization. Later BIMFs still use adaptive window
+        sizing and ``window_growth_rate``.
     window_size_cap : int
         Upper bound for the adaptive window size to prevent excessively
         large filters on sparse extrema distributions.
@@ -141,6 +142,18 @@ class FABEMD:
         self.window_size_cap = window_size_cap
         self.extrema_window = extrema_window
         self.window_growth_rate = window_growth_rate
+
+    @staticmethod
+    def _normalize_window_size(window_size: int, cap: int) -> int:
+        """Clamp a filter window to [3, cap] and make it odd."""
+        cap = max(3, int(cap))
+        if cap % 2 == 0:
+            cap -= 1
+        window_size = int(window_size)
+        window_size = max(3, min(window_size, cap))
+        if window_size % 2 == 0:
+            window_size += 1
+        return min(window_size, cap)
 
     # ------------------------------------------------------------------
     # Extrema detection
@@ -332,9 +345,17 @@ class FABEMD:
         bimfs: list = []
         self.window_sizes_: List[Tuple[int, int]] = []
 
-        # Monotonic window floor — ensures windows grow from fine to coarse
-        prev_w_upper = 3
-        prev_w_lower = 3
+        # Monotonic window floor — ensures windows grow from fine to coarse.
+        # If configured, the FABEMD initial window becomes the starting floor;
+        # later windows remain adaptive and are still limited by growth rate.
+        initial_window_floor = 3
+        if self.initial_window_size is not None:
+            initial_window_floor = self._normalize_window_size(
+                self.initial_window_size,
+                self.window_size_cap,
+            )
+        prev_w_upper = initial_window_floor
+        prev_w_lower = initial_window_floor
 
         while len(bimfs) < self.max_bimfs:
             h = residual.copy()
@@ -350,16 +371,12 @@ class FABEMD:
                 )
 
                 # 2. Adaptive window sizes (per the paper)
-                if self.initial_window_size is not None:
-                    w_upper = self.initial_window_size
-                    w_lower = self.initial_window_size
-                else:
-                    w_upper = self._compute_adaptive_window_size(
-                        max_map, h.shape, cap=self.window_size_cap
-                    )
-                    w_lower = self._compute_adaptive_window_size(
-                        min_map, h.shape, cap=self.window_size_cap
-                    )
+                w_upper = self._compute_adaptive_window_size(
+                    max_map, h.shape, cap=self.window_size_cap
+                )
+                w_lower = self._compute_adaptive_window_size(
+                    min_map, h.shape, cap=self.window_size_cap
+                )
 
                 # Enforce monotonic growth: never shrink below previous BIMF
                 w_upper = max(w_upper, prev_w_upper)

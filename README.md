@@ -125,7 +125,7 @@ result = pipeline.process()
 | `fabemd_max_bimfs` | int | 100 | Hard cap on the number of BIMFs to extract. Prevents runaway decomposition. The actual count is usually much lower as `fabemd_min_extrema` stops the process first. Set high (50–200) to let the natural stopping control apply. |
 | `fabemd_window_size_cap` | int | 201 | Maximum allowable window size (in pixels) for the adaptive order-statistics filters. Caps the envelope smoothing window to prevent it from growing too large on big images. Must be odd. Typical range: 101–501. |
 | `fabemd_extrema_window` | int | 3 | Window size for local extrema detection via `maximum_filter` / `minimum_filter`. Controls how far apart detected peaks/valleys must be. Larger values skip smaller fluctuations. Must be odd. Typical range: 3–9. |
-| `fabemd_initial_window_size` | int | None | If set, overrides the automatic initial window calculation. By default FABEMD computes the initial window from extrema spacing. Set only if you want manual control. |
+| `fabemd_initial_window_size` | int or None | None | Starting window size for FABEMD. `None` keeps the first window fully adaptive from extrema spacing; an integer sets the initial window floor after odd-size/clamp normalization. Later BIMFs still use adaptive window sizing and `fabemd_window_growth_rate`. |
 
 ### Homomorphic Filtering
 
